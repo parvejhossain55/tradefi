@@ -1,0 +1,1109 @@
+//@version=6
+indicator(
+     "Liquidity ABC Fib Pro",
+     shorttitle = "Liq-ABC-Fib",
+     overlay    = true,
+     max_lines_count  = 300,
+     max_labels_count = 300,
+     max_boxes_count  = 120,
+     max_bars_back    = 500)
+
+// ============================================================================
+// TRADE DIRECTION — the master switch. The engine searches ONLY this side.
+//   Buy Only  : support liquidity (swing low)   -> A below, B above, SL below C
+//   Sell Only : resistance liquidity (swing high) -> A above, B below, SL above C
+//   Both      : both sides; whichever pierces deeper wins
+// ============================================================================
+trade_dir = input.string("Buy Only", "Trade direction", options = ["Buy Only", "Sell Only", "Both"], group = "Trade Direction", tooltip = "Choose which side the engine looks for.\n\nBuy Only  - finds support liquidity (swing low) sweeps and takes the long setup.\nSell Only - finds resistance liquidity (swing high) sweeps and takes the short setup.\nBoth      - scans both sides; the deeper pierce wins.\n\nThe side is locked for the life of an open setup, so a live setup is never flipped.")
+
+liq_tf_1 = input.timeframe("15", "Liquidity TF 1", options = ["3", "5", "15", "30", "60", "240"], group = "Liquidity (Higher Timeframes)")
+liq_tf_2 = input.timeframe("30", "Liquidity TF 2", options = ["3", "5", "15", "30", "60", "240"], group = "Liquidity (Higher Timeframes)")
+piv_l = input.int(5, "Pivot left", minval = 1, maxval = 20, group = "Liquidity (Higher Timeframes)")
+piv_r = input.int(5, "Pivot right", minval = 1, maxval = 20, group = "Liquidity (Higher Timeframes)")
+max_liq = input.int(12, "Liquidity pool size", minval = 2, maxval = 30, group = "Liquidity (Higher Timeframes)")
+use_zone = input.bool(false, "Use liquidity zone for reclaim", group = "Liquidity (Higher Timeframes)")
+show_score = input.bool(false, "Show liquidity score on label", group = "Liquidity (Higher Timeframes)")
+min_touches = input.int(0, "Min touches to use a level", minval = 0, maxval = 20, group = "Liquidity (Higher Timeframes)")
+score_touch_w = input.float(1.0, "Score weight: touch", minval = 0.0, step = 0.1, group = "Liquidity (Higher Timeframes)")
+score_vol_w = input.float(0.5, "Score weight: volume", minval = 0.0, step = 0.1, group = "Liquidity (Higher Timeframes)")
+use_vol_sweep = input.bool(false, "Require strong volume on sweep", group = "Sweep Detection (Research Defaults)")
+sweep_vol_mult = input.float(1.5, "Min sweep volume (x avg bar)", minval = 0.1, step = 0.1, group = "Sweep Detection (Research Defaults)")
+max_liq_age = input.int(0, "Max level age (bars, 0 = no limit)", minval = 0, maxval = 2000, group = "Liquidity (Higher Timeframes)")
+drop_broken = input.bool(false, "Remove level when price closes through it", group = "Liquidity (Higher Timeframes)")
+use_deep_sweep = input.bool(false, "W1: require deep sweep", group = "Strength Gates (Step 11)")
+min_sweep_depth = input.float(0.5, "W1: min sweep depth (ATR)", minval = 0.0, step = 0.1, group = "Strength Gates (Step 11)")
+use_imp_vol = input.bool(false, "W2: require impulse volume", group = "Strength Gates (Step 11)")
+imp_vol_mult = input.float(1.0, "W2: min impulse volume (x avg bar)", minval = 0.0, step = 0.1, group = "Strength Gates (Step 11)")
+use_retr_vol = input.bool(false, "W3: require pullback volume", group = "Strength Gates (Step 11)")
+retr_vol_mult = input.float(0.8, "W3: min pullback volume (x avg bar)", minval = 0.0, step = 0.1, group = "Strength Gates (Step 11)")
+edge_d = input.int(25, "Liquidity label distance (bars)", minval = 3, maxval = 400, group = "Liquidity (Higher Timeframes)")
+
+trend_tf = input.timeframe("15", "Trend timeframe", options = ["3", "5", "15", "30", "60", "240"], group = "Trend Settings")
+ema_fast = input.int(9, "Fast EMA", minval = 1, group = "Trend Settings")
+ema_mid = input.int(21, "Middle EMA", minval = 1, group = "Trend Settings")
+ema_slow = input.int(50, "Slow EMA", minval = 1, group = "Trend Settings")
+trend_mode = input.string("EMA Stack", "Trend mode", options = ["Vol Band", "EMA Stack", "Both", "Off"], group = "Trend Settings")
+vb_len = input.int(12, "Vol band length", minval = 2, maxval = 100, group = "Trend Settings")
+vb_mult = input.float(2.0, "Vol band multiplier", minval = 0.1, step = 0.1, group = "Trend Settings")
+
+sw_min = input.float(0.05, "Minimum depth (ATR)", minval = 0.0, step = 0.01, group = "Sweep Detection (Research Defaults)")
+sw_max = input.float(3.00, "Maximum depth (ATR)", minval = 0.05, step = 0.05, tooltip = "U1: 0.80 -> 3.00. A deeper sweep is a STRONGER sweep; the old cap rejected the best setups.", group = "Sweep Detection (Research Defaults)")
+reclaim_n = input.int(5, "Reclaim window (bars)", minval = 1, maxval = 20, group = "Sweep Detection (Research Defaults)")
+reclaim_buf = input.float(0.05, "Reclaim close buffer (ATR)", minval = 0.0, step = 0.01, group = "Sweep Detection (Research Defaults)")
+
+min_impulse = input.float(0.30, "Minimum impulse (ATR)", minval = 0.0, step = 0.05, group = "Structure")
+c_min = input.float(0.382, "Minimum C retracement", step = 0.001, group = "Structure")
+setup_exp = input.int(40, "Setup expiry (bars)", minval = 5, maxval = 300, group = "Structure")
+
+fib_entry = input.float(0.618, "Entry extension", step = 0.001, group = "Fibonacci & Risk")
+fib_tp1 = input.float(1.28, "TP1 extension", step = 0.01, group = "Fibonacci & Risk")
+fib_tp2 = input.float(2.0, "TP2 extension", step = 0.01, group = "Fibonacci & Risk")
+entry_rule = input.string("618_and_B", "Entry rule", options = ["618_and_B", "618_only"], tooltip = "618_and_B: entry = max(B, Fib 0.618).  618_only: entry = Fib 0.618 level.", group = "Fibonacci & Risk")
+r_r_min = input.float(1.0, "Minimum entry-to-TP2 R:R", minval = 0.5, step = 0.1, group = "Fibonacci & Risk")
+
+use_ses = input.bool(true, "Use session", group = "Session (Bangladesh)")
+ses_mode = input.string("Entry Only", "Session mode", options = ["Full Chain", "Entry Only"], group = "Session (Bangladesh)")
+// U2a: default window now 04:00-23:59 (full trading day). Boss customises it in settings.
+sess_str = input.session("0400-2359:1234567", "Trading session (custom)", group = "Session (Bangladesh)")
+sess_tz = input.string("Asia/Dhaka", "Session timezone", group = "Session (Bangladesh)")
+
+lay_struct = input.bool(true, "L1 Structure", group = "Layers")
+lay_liq = input.bool(true, "L2 Liquidity", group = "Layers")
+lay_sweep = input.bool(true, "L3 Sweep", group = "Layers")
+lay_abc = input.bool(true, "L4 ABC", group = "Layers")
+lay_fib = input.bool(true, "L5 Fib extension", group = "Layers")
+lay_break = input.bool(true, "L6 Breakout", group = "Layers")
+lay_status = input.bool(true, "L7 Status tag", group = "Layers")
+show_abc = input.bool(true, "Show ABC structure", group = "Display")
+show_fib = input.bool(true, "Show entry / Fibonacci", group = "Display")
+show_tp_sl = input.bool(true, "Show SL / TP / risk boxes", group = "Display")
+show_grab = input.bool(true, "Show failed sweep / Grab", group = "Display")
+show_dash = input.bool(true, "Show dashboard", group = "Display")
+show_stats = input.bool(true, "Show chart status line", group = "Display")
+show_lvlabels = input.bool(true, "Show level detail on A/B/C labels", group = "Display")
+show_miss = input.bool(true, "Show miss-counters (why setups were skipped)", group = "Display")
+show_ses_bg = input.bool(true, "Shade outside session", group = "Display")
+keep_days = input.int(7, "History retention (days)", minval = 1, maxval = 20, group = "Display")
+trade_dist = input.int(40, "Trade line extent (bars)", minval = 5, maxval = 400, group = "Display")
+trade_exp = input.int(120, "Outcome timeout (bars)", minval = 20, maxval = 500, group = "Display")
+
+// Step 13: exactly six semantic colours. One colour = one meaning.
+// TP is always teal, SL is always red, Sell has no colour of its own —
+// the BUY/SELL text carries the direction.
+c_bull = input.color(#26a69a, "TP / Reward (teal)", group = "Colors")
+c_bear = input.color(#ef5350, "SL / Risk (red)", group = "Colors")
+c_strc = input.color(#2962ff, "Structure / ABC / Entry", group = "Colors")
+c_liq = input.color(#ff9d00, "Liquidity", group = "Colors")
+c_swp = input.color(#00bcd4, "Sweep", group = "Colors")
+c_inact = input.color(#787b86, "Inactive / GRAB / miss", group = "Colors")
+c_bg = input.color(#131722, "Dashboard background", group = "Colors")
+c_hdr = input.color(#1e3a8a, "Dashboard header", group = "Colors")
+
+// D. HTF fetchers. Pivot confirmation is an event, not a persistent price.
+f_liq() =>
+    pl = ta.pivotlow(low, piv_l, piv_r)
+    isNew = not na(pl) and na(pl[1])
+    [isNew, pl]
+
+// Step 7: body extreme of the pivot bar = the top edge of the liquidity zone.
+// For a swing low the zone runs from the wick low up to the candle body low.
+// Step 12: swing HIGH source for the sell side (buy-side liquidity).
+f_liqh() =>
+    ph = ta.pivothigh(high, piv_l, piv_r)
+    isNew = not na(ph) and na(ph[1])
+    [isNew, ph]
+
+// Step 12: body high of the pivot bar = inner edge of a sell-side zone.
+f_liqhz() =>
+    math.max(close[piv_r], open[piv_r])
+
+f_liqz() =>
+    math.min(close[piv_r], open[piv_r])
+
+f_stk() =>
+    [ta.ema(close, ema_fast), ta.ema(close, ema_mid), ta.ema(close, ema_slow)]
+
+// Step 6: volatility-band trend (from Upstocl IT Liquidity Sweep Filter, L95-109).
+// Double-EMA basis with an EMA of the absolute deviation.
+// Sticky band trend: the state flips only when price breaks a band edge,
+// exactly like the source indicator. This is a TREND read, not a breakout read.
+f_vband_state() =>
+    basis = ta.sma(ta.ema(close, vb_len), vb_len)
+    dev = ta.ema(math.abs(close - basis), vb_len * 3) * vb_mult
+    up = basis + dev
+    dn = basis - dev
+    var int tr = 0
+    if close > up
+        tr := 1
+    else if close < dn
+        tr := -1
+    tr
+
+f_vband() =>
+    basis = ta.sma(ta.ema(close, vb_len), vb_len)
+    dev = ta.ema(math.abs(close - basis), vb_len * 3) * vb_mult
+    [basis + dev, basis - dev]
+
+// E. All security requests are global, with lookahead OFF.
+[n1, p1] = request.security(syminfo.tickerid, liq_tf_1, f_liq(), lookahead = barmerge.lookahead_off)
+[n2, p2] = request.security(syminfo.tickerid, liq_tf_2, f_liq(), lookahead = barmerge.lookahead_off)
+zb1 = request.security(syminfo.tickerid, liq_tf_1, f_liqz(), lookahead = barmerge.lookahead_off)
+zb2 = request.security(syminfo.tickerid, liq_tf_2, f_liqz(), lookahead = barmerge.lookahead_off)
+[nh1, ph1] = request.security(syminfo.tickerid, liq_tf_1, f_liqh(), lookahead = barmerge.lookahead_off)
+[nh2, ph2] = request.security(syminfo.tickerid, liq_tf_2, f_liqh(), lookahead = barmerge.lookahead_off)
+zh1 = request.security(syminfo.tickerid, liq_tf_1, f_liqhz(), lookahead = barmerge.lookahead_off)
+zh2 = request.security(syminfo.tickerid, liq_tf_2, f_liqhz(), lookahead = barmerge.lookahead_off)
+[tf_e, tf_m, tf_s] = request.security(syminfo.tickerid, trend_tf, f_stk(), lookahead = barmerge.lookahead_off)
+[vb_up, vb_dn] = request.security(syminfo.tickerid, trend_tf, f_vband(), lookahead = barmerge.lookahead_off)
+vb_tr = request.security(syminfo.tickerid, trend_tf, f_vband_state(), lookahead = barmerge.lookahead_off)
+
+// F-G. Global calculations precede all state-machine reads.
+htf_bull = tf_e > tf_m and tf_m > tf_s
+htf_bear = tf_e < tf_m and tf_m < tf_s
+// Step 6: trend gate. "EMA Stack" reproduces the previous behaviour exactly;
+// "Vol Band" is the new default; "Both" requires the two to agree; "Off" disables.
+vb_bull = vb_tr == 1
+vb_bear = vb_tr == -1
+// Step 12: bull and bear reads kept separate so the gate can follow the side.
+trend_bull = trend_mode == "Off" ? true : trend_mode == "EMA Stack" ? htf_bull : trend_mode == "Both" ? htf_bull and vb_bull : vb_bull
+trend_bear = trend_mode == "Off" ? true : trend_mode == "EMA Stack" ? htf_bear : trend_mode == "Both" ? htf_bear and vb_bear : vb_bear
+var bool trend_ok = true
+atr = ta.atr(14)
+in_session = use_ses ? not na(time(timeframe.period, sess_str, sess_tz)) : true
+det_ses = use_ses and ses_mode == "Full Chain" ? in_session : true
+int liq_close_1 = time_close(liq_tf_1)
+int liq_close_2 = time_close(liq_tf_2)
+bool ready_1 = not na(time_close) and not na(liq_close_1) and time_close >= liq_close_1
+bool ready_2 = not na(time_close) and not na(liq_close_2) and time_close >= liq_close_2
+bool tf_warning = timeframe.in_seconds() > math.min(timeframe.in_seconds(liq_tf_1), math.min(timeframe.in_seconds(liq_tf_2), timeframe.in_seconds(trend_tf)))
+bool inputs_ok = sw_max >= sw_min and c_min >= 0 and fib_entry > 0 and fib_tp1 > fib_entry and fib_tp2 > fib_tp1
+
+// H. State, pools, drawings and bounded closed-trade records.
+// 0 IDLE | 10 PENDING | 1 A_SET | 2 B_SET | 3 VALIDATE_C | 4 ARMED | 5 IN_TRADE.
+type Visual
+    line ab = na
+    line bc = na
+    line ent = na
+    line stop = na
+    line one = na
+    line two = na
+    label la = na
+    label lb = na
+    label lc = na
+    label le = na
+    label ls = na
+    label l1 = na
+    label l2 = na
+    box risk = na
+    box reward = na
+    int stamp = na
+
+type ClosedTrade
+    int stamp
+    float fill
+    float threshold
+    float stop
+    float target1
+    float target2
+    float rr
+    bool hit1
+    string outcome
+
+var int ST = 0
+// Step 7: zone top of the liquidity level currently being scanned.
+var float zone_top = na
+// Step 12: trade direction. +1 = Buy (sweep down into support),
+// -1 = Sell (sweep up into resistance). The whole engine is direction-normalised.
+var int tdir = 1
+// Step 9: volume traded during the current sweep (sweep bar through reclaim bar).
+var float sw_vol = 0.0
+// Step 11: impulse volume (reclaim bar -> B confirm) and pullback volume.
+var float imp_vol = 0.0
+var float retr_vol = 0.0
+var int st_bar = na
+var float lv = na
+var float sw_low = na
+var int sw_bar = na
+var int sw_low_bar = na
+var float a_px = na
+var float b_px = na
+var float c_px = na
+var int a_bar = na
+var int b_bar = na
+var int c_bar = na
+var float entry_lvl = na
+var float sl = na
+var float tp1 = na
+var float tp2 = na
+var float rr = na
+var float t_fill = na
+var int t_bar = na
+var bool tp1_hit = false
+var int last_liq_1 = na
+var int last_liq_2 = na
+// Step 12 fix: swing highs need their OWN "new HTF bar" flags. Sharing the
+// low-side flags made the high branch always false, so no sell-side level
+// was ever added.
+var int last_liqh_1 = na
+var int last_liqh_2 = na
+var int n_swp = 0
+var int n_grab = 0
+var int n_sig = 0
+var int n_tp1 = 0
+var int n_tp2 = 0
+var int n_sl = 0
+var int n_timeout = 0
+var bool sigBuy = false
+var bool sigArm = false
+var bool sigSwp = false
+var bool sigGrab = false
+var bool sigTp1 = false
+var bool sigTp2 = false
+var bool sigSl = false
+var bool sigBreak = false
+// U1 miss-counters: one per blocking gate, so Boss can see WHICH filter kills a setup.
+var bool sigMissTrend = false
+var bool sigMissDeep = false
+var bool sigMissC = false
+var bool sigMissS = false
+var bool sigMissE = false
+var bool sigMissM = false
+var bool sigMissR = false
+// U1c: report-once guards. t/d fire once per LEVEL (repLv); S/R once per SETUP (repS/repR).
+var float repLv = na
+var int repDir = 0
+var bool repS = false
+var bool repR = false
+var int n_missTrend = 0
+var int n_missDeep = 0
+var int n_missC = 0
+var int n_missS = 0
+var int n_missE = 0
+var int n_missM = 0
+var int n_missR = 0
+var int n_missVol = 0
+var int n_gateW1 = 0
+var int n_gateW2 = 0
+var int n_gateW3 = 0
+var int n_noTouch = 0
+var int n_tooShallow = 0
+var float sigRR = na
+var array<float> liqLvl = array.new_float()
+var array<float> liqZTop = array.new_float()
+var array<int> liqTouch = array.new_int()
+var array<float> liqVol = array.new_float()
+var array<box> liqZb = array.new_box()
+var array<bool> liqUse = array.new_bool()
+var array<line> liqLn = array.new_line()
+var array<label> liqLb = array.new_label()
+var array<int> liqTime = array.new_int()
+var array<int> liqBar = array.new_int()
+var array<int> liqSide = array.new_int()
+var array<Visual> archives = array.new<Visual>()
+var array<label> events = array.new_label()
+var array<int> eventTime = array.new_int()
+var array<ClosedTrade> closedTrades = array.new<ClosedTrade>()
+var Visual live = na
+var table d = table.new(position.top_right, 3, 14, bgcolor = c_bg, border_width = 1, border_color = color.new(color.gray, 60))
+var table st = table.new(position.bottom_right, 1, 3, bgcolor = color.new(c_bg, 15), border_width = 1, border_color = color.new(color.gray, 70))
+
+// Helpers only mutate arrays, reference-object fields, or passed drawing IDs.
+// They never assign a global scalar or global drawing handle.
+f_price(float p) =>
+    na(p) ? "-" : str.tostring(p, format.mintick)
+
+// Step 8: relative volume reference for the liquidity score.
+float vol_avg = ta.sma(nz(volume), 50)
+
+// Step 8: score of a pool level = touches x weight + relative volume x weight.
+f_liq_score(int i) =>
+    float tch = array.get(liqTouch, i)
+    float vv = array.get(liqVol, i)
+    float rel = vol_avg > 0 ? vv / vol_avg : 0.0
+    tch * score_touch_w + math.min(rel, 5.0) * score_vol_w
+
+f_level(float ratio) =>
+    c_px + ratio * (b_px - a_px)
+
+f_event(float price, string txt, color col, bool below) =>
+    label id = label.new(bar_index, price, txt, style = below ? label.style_label_up : label.style_label_down, color = col, textcolor = color.white, size = size.small)
+    array.push(events, id)
+    array.push(eventTime, time)
+
+f_remove_liq(int i) =>
+    line.delete(array.remove(liqLn, i))
+    label.delete(array.remove(liqLb, i))
+    box.delete(array.remove(liqZb, i))
+    array.remove(liqLvl, i)
+    array.remove(liqZTop, i)
+    array.remove(liqTouch, i)
+    array.remove(liqVol, i)
+    array.remove(liqUse, i)
+    array.remove(liqTime, i)
+    array.remove(liqBar, i)
+    array.remove(liqSide, i)
+
+f_add_liq(float price, float ztop, int side) =>
+    bool duplicate = false
+    int n = array.size(liqLvl)
+    if n > 0
+        for i = 0 to n - 1
+            if math.abs(array.get(liqLvl, i) - price) < syminfo.mintick
+                duplicate := true
+    if not duplicate
+        // Step 7: zone top is the candle body low of the pivot bar. It is always
+        // >= the wick low, so the zone is a valid band.
+        // Step 12 fix: buy side inner edge = body low (>= wick low);
+        // sell side inner edge = body high (<= wick high).
+        float zt = na(ztop) ? price : (side > 0 ? math.max(ztop, price) : math.min(ztop, price))
+        array.push(liqLvl, price)
+        array.push(liqZTop, zt)
+        array.push(liqTouch, 0)
+        array.push(liqVol, 0.0)
+        array.push(liqUse, false)
+        array.push(liqTime, time)
+        array.push(liqBar, bar_index)
+        array.push(liqSide, side)
+        array.push(liqLn, line.new(bar_index, price, bar_index + 1, price, extend = extend.right, color = lay_liq ? c_liq : color.new(c_liq, 100), style = line.style_dotted, width = 1))
+        array.push(liqLb, label.new(bar_index + edge_d, price, (side > 0 ? "SSL " : "BSL ") + f_price(price), style = label.style_label_left, color = color.new(c_liq, 55), textcolor = color.white, size = size.tiny))
+        // Step 7: liquidity zone = band from the wick low up to the candle body low.
+        array.push(liqZb, box.new(bar_index, math.max(zt, price), bar_index + edge_d, math.min(zt, price), border_color = na, bgcolor = use_zone and lay_liq ? color.new(c_liq, 85) : na, xloc = xloc.bar_index))
+        while array.size(liqLvl) > max_liq
+            f_remove_liq(0)
+
+f_mark_liq(float price, bool swept, int side) =>
+    int n = array.size(liqLvl)
+    if n > 0
+        for i = n - 1 to 0
+            if not array.get(liqUse, i) and array.get(liqSide, i) == side and math.abs(array.get(liqLvl, i) - price) < syminfo.mintick
+                array.set(liqUse, i, true)
+                array.set(liqTime, i, time)
+                line L = array.get(liqLn, i)
+                line.set_color(L, swept ? color.new(c_swp, 10) : color.new(c_inact, 40))
+                line.set_extend(L, extend.none)
+                line.set_x2(L, bar_index)
+                label LB = array.get(liqLb, i)
+                label.set_xy(LB, bar_index, array.get(liqLvl, i))
+                // Step 9: swept level shows the volume traded there, relative to
+                // one average bar (V2.3 = 2.3 average bars of volume).
+                string swept_txt = "SWEPT"
+                if swept and vol_avg > 0
+                    swept_txt := "SWEPT · V" + str.tostring(sw_vol / vol_avg, "#.#")
+                label.set_text(LB, swept ? swept_txt : "FAILED")
+                label.set_color(LB, swept ? color.new(c_swp, 15) : color.new(c_inact, 15))
+                // Failed pool objects remain accounted for, even when hidden.
+                if not swept and not show_grab
+                    line.set_color(L, color.new(c_inact, 100))
+                    label.set_text(LB, "")
+                    label.set_color(LB, color.new(c_inact, 100))
+                break
+
+// Step 12: direction-aware level pick. d = +1 buy side (levels below price),
+// d = -1 sell side (levels above price). The buy path is byte-for-byte the
+// old f_nearest_under() logic.
+f_nearest_side(int d) =>
+    float best = na
+    int bi = -1
+    int n = array.size(liqLvl)
+    if n > 0
+        for i = 0 to n - 1
+            float level = array.get(liqLvl, i)
+            bool side_ok = array.get(liqSide, i) == d
+            bool hit = d > 0 ? low < level : high > level
+            bool better = d > 0 ? (na(best) or level < best) : (na(best) or level > best)
+            if not array.get(liqUse, i) and side_ok and hit and array.get(liqTouch, i) >= min_touches and better
+                best := level
+                bi := i
+    bi
+
+f_line(line id, int x1, float y1, int x2, float y2, color col, bool dashed, int width) =>
+    line out = id
+    if na(out)
+        out := line.new(x1, y1, x2, y2, color = col, style = dashed ? line.style_dashed : line.style_solid, width = width)
+    else
+        line.set_xy1(out, x1, y1)
+        line.set_xy2(out, x2, y2)
+    out
+
+f_label(label id, int x, float y, string txt, color col, bool tag) =>
+    label out = id
+    if na(out)
+        // Step 13: A/B/C point labels have no background block; right-edge tags keep one.
+        out := label.new(x, y, txt, style = tag ? label.style_label_left : label.style_label_up, color = tag ? color.new(col, 25) : color.new(col, 100), textcolor = color.white, size = size.tiny)
+    else
+        label.set_xy(out, x, y)
+        label.set_text(out, txt)
+    out
+
+f_box(box id, int x1, float top, int x2, float bottom, color col) =>
+    box out = id
+    if na(out)
+        // Step 13: almost transparent fill, faint border.
+        out := box.new(x1, top, x2, bottom, border_color = color.new(col, 85), bgcolor = color.new(col, 90))
+    else
+        box.set_lefttop(out, x1, top)
+        box.set_rightbottom(out, x2, bottom)
+    out
+
+f_delete_visual(Visual v) =>
+    // Step 2 / A4: no temporary arrays. line.delete(na) and label.delete(na) are safe.
+    line.delete(v.ab)
+    line.delete(v.bc)
+    line.delete(v.ent)
+    line.delete(v.stop)
+    line.delete(v.one)
+    line.delete(v.two)
+    label.delete(v.la)
+    label.delete(v.lb)
+    label.delete(v.lc)
+    label.delete(v.le)
+    label.delete(v.ls)
+    label.delete(v.l1)
+    label.delete(v.l2)
+    box.delete(v.risk)
+    box.delete(v.reward)
+
+f_update_visual(Visual v) =>
+    int xe = bar_index + trade_dist
+    if show_abc
+        // Step 13: L1 = the A->B structure leg, L4 = the A/B/C point labels.
+        if lay_struct
+            v.ab := f_line(v.ab, a_bar, a_px, b_bar, b_px, c_strc, false, 1)
+        if lay_abc
+            v.la := f_label(v.la, a_bar, a_px, show_lvlabels ? "A " + f_price(a_px) : "A", c_strc, false)
+            v.lb := f_label(v.lb, b_bar, b_px, show_lvlabels ? "B " + f_price(b_px) : "B", c_strc, false)
+        if ST >= 2
+            int xc = na(c_bar) ? bar_index : c_bar
+            float pc = na(c_px) ? (tdir > 0 ? low : high) : c_px
+            if lay_abc
+                v.bc := f_line(v.bc, b_bar, b_px, xc, pc, c_strc, true, 1)
+            if not na(c_px) and lay_abc
+                float retr_lbl = tdir * (b_px - a_px) > 0 ? (b_px - c_px) / (b_px - a_px) : na
+                string c_txt = show_lvlabels ? "C " + f_price(c_px) + " " + str.tostring(retr_lbl * 100, "#.##") + "%" : "C"
+                v.lc := f_label(v.lc, c_bar, c_px, c_txt, c_strc, false)
+    if ST >= 4
+        int left = ST == 5 ? t_bar : c_bar
+        if show_fib and lay_fib
+            // Step 13: Entry solid structure colour width 2.
+            v.ent := f_line(v.ent, left, entry_lvl, xe, entry_lvl, c_strc, false, 2)
+            v.le := f_label(v.le, xe, entry_lvl, "ENTRY " + f_price(entry_lvl), c_strc, true)
+        if show_tp_sl
+            // SL solid red, TP1 dotted teal, TP2 solid teal.
+            v.stop := f_line(v.stop, left, sl, xe, sl, c_bear, false, 1)
+            v.one := f_line(v.one, left, tp1, xe, tp1, c_bull, true, 1)
+            v.two := f_line(v.two, left, tp2, xe, tp2, c_bull, false, 1)
+            // Blueprint labels at right edge
+            string entry_lbl = (entry_rule == "618_only" or math.abs(entry_lvl - (c_px + fib_entry * (b_px - a_px))) < syminfo.mintick * 100) ? ("0.618 " + f_price(entry_lvl)) : ("Entry Point " + f_price(entry_lvl))
+            v.le := f_label(v.le, xe, entry_lvl, entry_lbl, c_strc, true)
+            v.ls := f_label(v.ls, xe, sl, "SL " + f_price(sl), c_bear, true)
+            v.l1 := f_label(v.l1, xe, tp1, "TP1 " + f_price(tp1), c_bull, true)
+            v.l2 := f_label(v.l2, xe, tp2, "TP2 " + f_price(tp2), c_bull, true)
+            // Directive #7 Stage 1.7: risk box top = fib0618_lv (always 0 → 0.618 per blueprint).
+            // Skip when a/b/c any na so boxes don't blink to na/wrong values mid-setup.
+            float fib0618_lv = (na(a_px) or na(b_px) or na(c_px)) ? na : (c_px + fib_entry * (b_px - a_px))
+            if not na(fib0618_lv)
+                v.risk := f_box(v.risk, left, fib0618_lv, xe, sl, c_bear)
+            // Blueprint reward box: SL → TP2 (was entry → TP1 in pre-Stage 1)
+            v.reward := f_box(v.reward, left, tp2, xe, sl, c_bull)
+    v
+
+// Reset BEFORE the state machine; global plots/alerts read the resulting pulses.
+sigBuy := false
+sigArm := false
+sigSwp := false
+sigGrab := false
+sigTp1 := false
+sigTp2 := false
+sigSl := false
+sigBreak := false
+// U1: reset miss-counters BEFORE the state machine sets them (Pitfall 11).
+sigMissTrend := false
+sigMissDeep := false
+sigMissC := false
+sigMissS := false
+sigMissE := false
+sigMissM := false
+sigMissR := false
+sigRR := na
+
+// I. Confirmed-bar processing. EXACTLY ONE branch of this state chain executes.
+if barstate.isconfirmed
+    // Step 12: direction-normalised OHLC for the whole state machine.
+    // ext = the sweep-side extreme (Buy: low, Sell: high).
+    // oppext = the opposite side (Buy: high, Sell: low).
+    float ext = tdir > 0 ? low : high
+    float oppext = tdir > 0 ? high : low
+    // Only commit a pivot after its source HTF bar closes. Timestamp gating also
+    // prevents gaps_off from replaying one HTF event on multiple chart bars.
+    if n1 and not na(p1) and ready_1 and (na(last_liq_1) or liq_close_1 != last_liq_1)
+        f_add_liq(p1, zb1, 1)
+        last_liq_1 := liq_close_1
+    if n2 and not na(p2) and ready_2 and (na(last_liq_2) or liq_close_2 != last_liq_2)
+        f_add_liq(p2, zb2, 1)
+        last_liq_2 := liq_close_2
+    // Step 12: sell-side liquidity = swing highs (buy-side liquidity for sellers).
+    if nh1 and not na(ph1) and ready_1 and (na(last_liqh_1) or liq_close_1 != last_liqh_1)
+        f_add_liq(ph1, zh1, -1)
+        last_liqh_1 := liq_close_1
+    if nh2 and not na(ph2) and ready_2 and (na(last_liqh_2) or liq_close_2 != last_liqh_2)
+        f_add_liq(ph2, zh2, -1)
+        last_liqh_2 := liq_close_2
+
+    int oldST = ST
+    string outcome = ""
+    // U1b: single source of truth for the ST 0 sweep scan. Set doScan in EVERY
+    // path that reaches IDLE this bar (normal idle, or a setup that just failed),
+    // then run the scan once, below the cleanup block. Never twice on one bar.
+    bool doScan = false
+    // Expiry applies to the whole pre-entry setup, measured from penetration.
+    // Full Chain cancels pre-entry work outside session; open trades still run.
+    if ST != 0 and ST != 5 and (not det_ses or bar_index - st_bar > setup_exp)
+        if ST == 10
+            f_mark_liq(lv, false, tdir)
+            sigGrab := true
+            n_grab += 1
+            if show_grab
+                f_event(ext, "GRAB", color.new(c_inact, 15), true)
+        // U1b: E = ran out of time. M = was still waiting for a deeper C.
+        if ST == 3 and not na(a_px) and not na(b_px) and not na(c_px) and tdir * (b_px - a_px) > 0
+            float retr_exp = (b_px - c_px) / (b_px - a_px)
+            if retr_exp < c_min
+                sigMissM := true
+                n_missM += 1
+            else
+                sigMissE := true
+                n_missE += 1
+        else
+            sigMissE := true
+            n_missE += 1
+        ST := 0
+        doScan := true
+    else if ST == 0
+        doScan := true
+    else if ST == 10
+        // Step 9: accumulate the volume traded during this sweep.
+        sw_vol += nz(volume)
+        // Keep the sweep extreme, including any lower pending/reclaim-bar low.
+        if tdir * ext < tdir * sw_low
+            sw_low := ext
+            sw_low_bar := bar_index
+        int elapsed = bar_index - sw_bar
+        // Step 7: with use_zone on, the reclaim threshold is the zone top (the
+        // pivot candle's body low) instead of an ATR buffer above the wick low.
+        float reclaim_lvl = use_zone and not na(zone_top) ? zone_top : lv + tdir * reclaim_buf * atr
+        if elapsed <= reclaim_n and tdir * close > tdir * reclaim_lvl
+            // Step 9: optional strong-volume gate on the sweep. OFF by default,
+            // so the strategy behaviour is unchanged until Boss enables it.
+            float vol_needed = vol_avg * sweep_vol_mult * (elapsed + 1)
+            // Step 11 / W1: how deep below the level the whole sweep reached.
+            float sweep_deep = tdir * (lv - sw_low) / atr
+            bool w1_fail = use_deep_sweep and sweep_deep < min_sweep_depth
+            bool w9_fail = use_vol_sweep and sw_vol < vol_needed
+            if w1_fail or w9_fail
+                if w1_fail
+                    n_gateW1 += 1
+                if w9_fail
+                    n_missVol += 1
+                f_mark_liq(lv, false, tdir)
+                ST := 0
+                doScan := true
+            else
+                a_px := sw_low
+                a_bar := sw_low_bar
+                b_px := tdir > 0 ? high : low
+                b_bar := bar_index
+                // Step 11: start the impulse and pullback volume counters here.
+                imp_vol := nz(volume)
+                retr_vol := 0.0
+                f_mark_liq(lv, true, tdir)
+                n_swp += 1
+                sigSwp := true
+                ST := 1
+        else if elapsed >= reclaim_n
+            f_mark_liq(lv, false, tdir)
+            n_grab += 1
+            sigGrab := true
+            if show_grab
+                f_event(ext, "GRAB", color.new(c_inact, 15), true)
+            ST := 0
+    else if ST == 1
+        // Step 11 / W2: volume traded during the impulse leg (A -> B).
+        imp_vol += nz(volume)
+        if tdir * ext < tdir * a_px
+            a_px := ext
+            a_bar := bar_index
+        if tdir * oppext > tdir * b_px
+            b_px := oppext
+            b_bar := bar_index
+        if tdir * (b_px - a_px) >= min_impulse * atr
+            // Step 11 / W2: price moved, but did volume follow?
+            float imp_needed = vol_avg * imp_vol_mult * (bar_index - a_bar + 1)
+            if use_imp_vol and imp_vol < imp_needed
+                n_gateW2 += 1
+                ST := 0
+                doScan := true
+            else
+                ST := 2
+    else if ST == 2
+        // Step 11 / W3: volume traded during the pullback (B -> C).
+        retr_vol += nz(volume)
+        // Stage 1: high > b_px → keep ST 2, drop any tentative C; same bar blocked.
+        if tdir * oppext > tdir * b_px
+            b_px := oppext
+            b_bar := bar_index
+            c_px := na
+            c_bar := na
+        else if tdir * oppext <= tdir * b_px and tdir * close < tdir * b_px
+            c_px := ext
+            c_bar := bar_index
+            ST := 3
+    else if ST == 3
+        // Step 11 / W3: keep counting the pullback volume while C forms.
+        retr_vol += nz(volume)
+        // Stage 1: high > b_px → reset C, return to ST 2.
+        if tdir * oppext > tdir * b_px
+            b_px := oppext
+            b_bar := bar_index
+            c_px := na
+            c_bar := na
+            ST := 2
+        else
+            // Directive #7 Stage 1.7: c_px tracks the pullback extreme.
+            if tdir * ext < tdir * c_px
+                c_px := ext
+                c_bar := bar_index
+            float rangeAB = b_px - a_px
+            float retr = tdir * rangeAB > 0 ? (b_px - c_px) / rangeAB : na
+            // U1: c_max removed (Boss Oct 22) — no retracement ceiling. C > A is the only rule.
+            if tdir * rangeAB <= 0 or tdir * c_px <= tdir * a_px
+                ST := 0
+                sigMissC := true
+                doScan := true        // U1b: rescan THIS bar's sweep
+            else if retr >= c_min
+                // Step 11 / W3: real rejection or fake pullback? Volume decides.
+                float retr_needed = vol_avg * retr_vol_mult * math.max(1, bar_index - b_bar + 1)
+                if use_retr_vol and retr_vol < retr_needed
+                    n_gateW3 += 1
+                    ST := 0
+                    doScan := true
+                else
+                    float f0618 = c_px + fib_entry * (b_px - a_px)
+                    entry_lvl := entry_rule == "618_only" ? f0618 : (tdir > 0 ? math.max(b_px, f0618) : math.min(b_px, f0618))
+                    sl := f_level(0.0)
+                    tp1 := f_level(fib_tp1)
+                    tp2 := f_level(fib_tp2)
+                    rr := tdir * (entry_lvl - sl) > 0 ? tdir * (tp2 - entry_lvl) / math.abs(entry_lvl - sl) : na
+                    sigArm := true
+                    ST := 4
+    else if ST == 4
+        // Stage 1: B is fixed once ARMED.  C can update lower.
+        if tdir * ext < tdir * c_px
+            c_px := ext
+            c_bar := bar_index
+        if not na(b_px) and not na(a_px) and not na(c_px)
+            float f0618_v2 = c_px + fib_entry * (b_px - a_px)
+            entry_lvl := entry_rule == "618_only" ? f0618_v2 : (tdir > 0 ? math.max(b_px, f0618_v2) : math.min(b_px, f0618_v2))
+            sl := f_level(0.0)
+            tp1 := f_level(fib_tp1)
+            tp2 := f_level(fib_tp2)
+            rr := tdir * (entry_lvl - sl) > 0 ? tdir * (tp2 - entry_lvl) / math.abs(entry_lvl - sl) : na
+            float rangeAB_v4 = b_px - a_px
+            // U1: c_max removed — C > A is the only validity rule once armed.
+            if tdir * rangeAB_v4 <= 0 or tdir * c_px <= tdir * a_px
+                ST := 0
+                sigMissC := true
+                doScan := true        // U1b: rescan THIS bar's sweep
+            else
+                // U1b: S = entry blocked by session, R = blocked by R:R floor.
+                if tdir * close > tdir * entry_lvl and not in_session and not repS
+                    sigMissS := true
+                    n_missS += 1
+                    repS := true
+                if tdir * close > tdir * entry_lvl and rr < r_r_min and not repR
+                    sigMissR := true
+                    n_missR += 1
+                    repR := true
+                if tdir * close > tdir * entry_lvl and in_session and rr >= r_r_min
+                    sigBuy := true
+                    sigRR := rr
+                    n_sig += 1
+                    t_fill := close
+                    t_bar := bar_index
+                    tp1_hit := false
+                    sigBreak := true
+                    if lay_break
+                        f_event(tdir > 0 ? low : high, (tdir > 0 ? "BUY" : "SELL") + "\nR:R " + str.tostring(sigRR, "#.##"), c_strc, true)
+                    ST := 5
+    else if ST == 5
+        // SL-first resolves ambiguous OHLC bars conservatively. Levels are frozen.
+        // Entry-bar outcomes are intentionally not tested: entry is at its close.
+        if tdir * ext <= tdir * sl
+            n_sl += 1
+            sigSl := true
+            f_event(ext, "STOP", color.new(c_bear, 5), true)
+            outcome := "STOP"
+            ST := 0
+        else
+            if not tp1_hit and tdir * oppext >= tdir * tp1
+                tp1_hit := true
+                n_tp1 += 1
+                sigTp1 := true
+                f_event(tp1, "TP1 HIT", color.new(c_bull, 5), false)
+            if tdir * oppext >= tdir * tp2
+                n_tp2 += 1
+                sigTp2 := true
+                f_event(tp2, "TP2 HIT", c_bull, false)
+                outcome := "TP2"
+                ST := 0
+            else if bar_index - t_bar > trade_exp
+                n_timeout += 1
+                f_event(close, "TIMEOUT", color.new(c_inact, 20), true)
+                outcome := "TIMEOUT"
+                ST := 0
+
+    // Drawing lifecycle: confirmed historical creation is essential (spec bug 8).
+    // The last/isnew layer below only chases existing right-edge tags.
+    if ST >= 1 and ST <= 5
+        if na(live)
+            live := Visual.new()
+        live := f_update_visual(live)
+    if oldST != 0 and ST == 0
+        if oldST == 5
+            array.push(closedTrades, ClosedTrade.new(time, t_fill, entry_lvl, sl, tp1, tp2, rr, tp1_hit, outcome))
+            if not na(live)
+                live.stamp := time
+                array.push(archives, live)
+                live := na
+                repS := false
+                repR := false
+        else if not na(live)
+            f_delete_visual(live)
+            live := na
+            repS := false
+            repR := false
+        // Idle dashboard must not present stale levels as a live setup.
+        a_px := na
+        b_px := na
+        c_px := na
+        a_bar := na
+        b_bar := na
+        c_bar := na
+        entry_lvl := na
+        sl := na
+        tp1 := na
+        tp2 := na
+        rr := na
+        st_bar := na
+
+    // ===== U1b: the single ST 0 sweep scan =====
+    // Runs exactly once per bar, AFTER the cleanup block, so a setup that just
+    // failed still has its drawing deleted before a new one may be created.
+    if doScan and ST == 0
+        // Step 12: pick the side. "Both" takes whichever side pierced deeper.
+        int idx = -1
+        int use_dir = 1
+        if trade_dir == "Sell Only"
+            idx := f_nearest_side(-1)
+            use_dir := -1
+        else if trade_dir == "Both"
+            int ib = f_nearest_side(1)
+            int isl = f_nearest_side(-1)
+            float db = ib >= 0 and not na(atr) ? (array.get(liqLvl, ib) - low) / atr : -1.0
+            float ds = isl >= 0 and not na(atr) ? (high - array.get(liqLvl, isl)) / atr : -1.0
+            if db >= ds
+                idx := ib
+                use_dir := 1
+            else
+                idx := isl
+                use_dir := -1
+        else
+            idx := f_nearest_side(1)
+            use_dir := 1
+        if idx >= 0 and det_ses and inputs_ok and not na(atr) and atr > 0
+            tdir := use_dir
+            trend_ok := tdir > 0 ? trend_bull : trend_bear
+            float candidate = array.get(liqLvl, idx)
+            // Direction-normalised depth: Buy = how far below, Sell = how far above.
+            float depth = tdir * (candidate - (tdir > 0 ? low : high)) / atr
+            // U1c: reach the level FIRST. A bar that never traded at the level is a
+            // non-event, so it can no longer fire t/d. Then t/d fire ONCE per level.
+            // Step 12 fix: the bar must REACH the level with its high in both
+            // directions (a support is reached from above, a resistance from
+            // below). One test works for both.
+            if high < candidate
+                n_noTouch += 1
+            else if not trend_ok
+                if candidate != repLv or tdir != repDir
+                    sigMissTrend := true
+                    n_missTrend += 1
+                    repLv := candidate
+                    repDir := tdir
+            else if depth < sw_min
+                n_tooShallow += 1
+            else if depth > sw_max
+                if candidate != repLv or tdir != repDir
+                    sigMissDeep := true
+                    n_missDeep += 1
+                    repLv := candidate
+                    repDir := tdir
+            else
+                lv := candidate
+                zone_top := array.get(liqZTop, idx)
+                sw_vol := nz(volume)
+                sw_low := tdir > 0 ? low : high
+                sw_bar := bar_index
+                sw_low_bar := bar_index
+                st_bar := bar_index
+                a_px := na
+                b_px := na
+                c_px := na
+                a_bar := na
+                b_bar := na
+                c_bar := na
+                entry_lvl := na
+                sl := na
+                tp1 := na
+                tp2 := na
+                rr := na
+                ST := 10
+                zone_top := na
+                repS := false
+                repR := false
+
+
+    // J. Age cleanup and hard caps. All bounds are checked before indexing.
+    // Budget: 22 archived + 1 live visual => <=138 lines / 161 labels / 58 boxes.
+    // (Step 7 added up to 12 liquidity-zone boxes on top of the 46 visual boxes.)
+    // Plus <=30 liquidity objects and <=90 event labels => <=281 total labels.
+    int cutoff = time - keep_days * 86400000
+    int nl = array.size(liqLvl)
+    if nl > 0
+        for i = nl - 1 to 0
+            bool pending = ST == 10 and math.abs(array.get(liqLvl, i) - lv) < syminfo.mintick
+            if array.get(liqTime, i) < cutoff and not pending
+                f_remove_liq(i)
+    while array.size(archives) > 0
+        Visual oldest = array.get(archives, 0)
+        if array.size(archives) > 22 or oldest.stamp < cutoff
+            f_delete_visual(array.shift(archives))
+        else
+            break
+    while array.size(events) > 0
+        if array.size(events) > 90 or array.get(eventTime, 0) < cutoff
+            label.delete(array.shift(events))
+            array.shift(eventTime)
+        else
+            break
+    while array.size(closedTrades) > 0
+        ClosedTrade oldest = array.get(closedTrades, 0)
+        if array.size(closedTrades) > 300 or oldest.stamp < cutoff
+            array.shift(closedTrades)
+        else
+            break
+    // Step 10: lifecycle. A level lives until it is used, filled, or too old.
+    // Backward loop so removing an entry cannot shift the indices we visit.
+    int nlife = array.size(liqLvl)
+    if nlife > 0
+        for i = nlife - 1 to 0
+            if not array.get(liqUse, i)
+                float lvx = array.get(liqLvl, i)
+                bool too_old = max_liq_age > 0 and bar_index - array.get(liqBar, i) > max_liq_age
+                bool broken = drop_broken and (array.get(liqSide, i) > 0 ? close < lvx : close > lvx)
+                if too_old or broken
+                    f_remove_liq(i)
+    int nt = array.size(liqLvl)
+    if nt > 0
+        for i = 0 to nt - 1
+            if not array.get(liqUse, i)
+                float lv_i = array.get(liqLvl, i)
+                float zt_i = array.get(liqZTop, i)
+                // Step 8/12: a touch is a bar whose range overlaps the zone.
+                // Buy side: zone = [wick low, body low]. Sell side: [body high, wick high].
+                int sd = array.get(liqSide, i)
+                bool touched = sd > 0 ? (low <= zt_i and high >= lv_i) : (low <= lv_i and high >= zt_i)
+                if touched
+                    array.set(liqTouch, i, array.get(liqTouch, i) + 1)
+                    array.set(liqVol, i, array.get(liqVol, i) + nz(volume))
+                label.set_xy(array.get(liqLb, i), bar_index + edge_d, lv_i)
+                // Step 7: keep the zone band reaching the right edge like the line.
+                box.set_right(array.get(liqZb, i), bar_index + edge_d)
+                // Step 8: label carries the touch count and the score.
+                string lvl_txt = (array.get(liqSide, i) > 0 ? "SSL " : "BSL ") + f_price(lv_i)
+                if show_score
+                    lvl_txt := lvl_txt + " · T" + str.tostring(array.get(liqTouch, i)) + " · V" + str.tostring(f_liq_score(i), "#.#")
+                label.set_text(array.get(liqLb, i), lvl_txt)
+
+// K. Stage 1: per-tick right-edge chase for lines, labels, boxes.  status label.
+// var handles declared at global scope (live, etc.) — this block only references them.
+var label liveStatus = na
+if barstate.islast
+    // Step 2 / A3: the chase target (bar_index + edge_d) only changes when a new
+    // bar starts, so repositioning once per bar is visually identical to per-tick.
+    if barstate.isnew
+        int n = array.size(liqLvl)
+        if n > 0
+            for i = 0 to n - 1
+                if not array.get(liqUse, i)
+                    label.set_xy(array.get(liqLb, i), bar_index + edge_d, array.get(liqLvl, i))
+                    // Step 7: keep the zone band reaching the right edge like the line.
+                    box.set_right(array.get(liqZb, i), bar_index + edge_d)
+    if not na(live) and ST >= 4 and ST <= 5
+        int xe = bar_index + trade_dist
+        // Right-edge chase for ENTRY/SL/TP1/TP2 lines
+        if not na(entry_lvl)
+            line.set_xy2(live.ent, xe, entry_lvl)
+        if not na(sl)
+            line.set_xy2(live.stop, xe, sl)
+        if not na(tp1)
+            line.set_xy2(live.one, xe, tp1)
+        if not na(tp2)
+            line.set_xy2(live.two, xe, tp2)
+        // Right-edge chase for labels
+        if not na(live.le)
+            label.set_xy(live.le, xe, entry_lvl)
+        if not na(live.ls)
+            label.set_xy(live.ls, xe, sl)
+        if not na(live.l1)
+            label.set_xy(live.l1, xe, tp1)
+        if not na(live.l2)
+            label.set_xy(live.l2, xe, tp2)
+        // Right-edge chase for risk/reward boxes (set right only — left/top/bottom unchanged)
+        // Directive #7 Stage 1.7: top = fib0618_lv (independent of entry_rule), bottom unchanged (math.min(entry_lvl, sl)).
+        if not na(sl) and not na(a_px) and not na(b_px) and not na(c_px)
+            float fib0618_lv_live = c_px + fib_entry * (b_px - a_px)
+            box.set_right(live.risk, xe)
+            box.set_top(live.risk, math.max(fib0618_lv_live, sl))
+            box.set_bottom(live.risk, math.min(entry_lvl, sl))
+        if not na(sl) and not na(tp2)
+            box.set_right(live.reward, xe)
+            box.set_top(live.reward, math.max(tp2, sl))
+            box.set_bottom(live.reward, math.min(tp2, sl))
+
+        // Live status label
+        // Step 2 / A1: reuse the label object. No delete + new on every tick.
+        string status_txt = ""
+        if ST == 5
+            status_txt := "BUY CONFIRMED"
+        else if ST == 4
+            if rr < r_r_min
+                status_txt := "R:R LOW (" + str.tostring(rr, "#.##") + ")"
+            else if tdir * close > tdir * entry_lvl
+                status_txt := (tdir > 0 ? "ABOVE" : "BELOW") + " ENTRY (bar not closed)"
+            else
+                float dist_to = math.abs(entry_lvl - close)
+                status_txt := "WAITING: " + str.tostring(math.max(0.0, dist_to), format.mintick) + " to entry"
+        if status_txt != "" and lay_status
+            float status_y = math.max(entry_lvl, sl) + math.max(0.5 * atr, 1.0)
+            if na(liveStatus)
+                liveStatus := label.new(bar_index, status_y, status_txt, style = label.style_none, textcolor = c_bear, size = size.normal)
+            else
+                label.set_xy(liveStatus, bar_index, status_y)
+                label.set_text(liveStatus, status_txt)
+        else
+            if not na(liveStatus)
+                label.delete(liveStatus)
+            liveStatus := na
+else
+    if not na(liveStatus)
+        label.delete(liveStatus)
+    liveStatus := na
+
+// L. Global plots only. Visibility inputs are honored for all related markers.
+show_ema_plot = trend_mode == "EMA Stack" or trend_mode == "Both"
+show_band_plot = trend_mode == "Vol Band" or trend_mode == "Both"
+plot(show_ema_plot ? tf_e : na, "Trend EMA fast", color = color.new(#2962ff, 45), linewidth = 1)
+plot(show_ema_plot ? tf_s : na, "Trend EMA slow", color = color.new(#ff6d00, 45), linewidth = 1)
+plot(show_band_plot ? vb_up : na, "Trend band upper", color = color.new(#787b86, 40), linewidth = 1)
+plot(show_band_plot ? vb_dn : na, "Trend band lower", color = color.new(#787b86, 40), linewidth = 1)
+bgcolor(show_ses_bg and use_ses and not in_session ? color.new(color.gray, 94) : na, title = "Outside Session")
+plotshape(sigBuy and tdir > 0, "BUY", shape.labelup, location.belowbar, color = c_strc, size = size.small, text = "BUY", textcolor = color.black)
+plotshape(sigBuy and tdir < 0, "SELL", shape.labeldown, location.abovebar, color = c_bear, size = size.small, text = "SELL", textcolor = color.white)
+plotshape(lay_sweep and show_grab and sigGrab, "Grab", shape.xcross, location.belowbar, color = c_inact, size = size.tiny)
+// Step 13: markers differ by SHAPE as well as colour.
+// Sweep = circle (cyan), GRAB = X (grey), BUY = triangle up (teal),
+// STOP = X (red), TP1 = hollow diamond, TP2 = filled diamond.
+plotshape(lay_sweep and sigSwp, "Sweep", shape.circle, location.belowbar, color = color.new(c_swp, 20), size = size.tiny)
+plotshape(lay_break and sigTp1, "TP1", shape.diamond, location.abovebar, color = color.new(c_bull, 100), size = size.tiny)
+plotshape(lay_break and sigTp2, "TP2", shape.diamond, location.abovebar, color = c_bull, size = size.tiny)
+plotshape(lay_break and sigSl, "Stop", shape.xcross, location.belowbar, color = c_bear, size = size.small)
+plotshape(lay_break and sigBreak, "Breakout Confirmed", shape.diamond, location.belowbar, color = c_strc, size = size.tiny, text = "Breakout", textcolor = c_strc)
+// U1b miss-counters. plotchar has NO object budget, so this costs nothing and needs no dashboard.
+// t = trend blocked | d = too deep (sw_max) | c = C invalid
+// S = session blocked | E = setup_exp expired | M = C minimum too deep | R = R:R below floor
+plotchar(show_miss and sigMissTrend, "Miss: trend", "t", location.abovebar, color = color.new(color.gray, 40), size = size.tiny)
+plotchar(show_miss and sigMissDeep, "Miss: too deep (sw_max)", "d", location.abovebar, color = color.new(#ff5722, 0), size = size.small)
+plotchar(show_miss and sigMissC, "Miss: C invalid", "c", location.abovebar, color = color.new(#9c27b0, 0), size = size.small)
+plotchar(show_miss and sigMissS, "Miss: session", "S", location.abovebar, color = color.new(#00897b, 0), size = size.small)
+plotchar(show_miss and sigMissE, "Miss: setup expired", "E", location.abovebar, color = color.new(#d32f2f, 0), size = size.small)
+plotchar(show_miss and sigMissM, "Miss: C minimum too deep", "M", location.abovebar, color = color.new(#1976d2, 0), size = size.small)
+plotchar(show_miss and sigMissR, "Miss: R:R below floor", "R", location.abovebar, color = color.new(#fbc02d, 0), size = size.small)
+
+// M. Step 3 / A5: every string below is built inside the barstate.islast gate,
+// so historical bars and intrabar ticks pay nothing for dashboard formatting.
+// Step 4: the dashboard is now 6 data rows; the counters moved to the chart status line.
+// state_text stays at global scope: a switch on an int costs nothing.
+// Step 3 / A5 moved only the expensive string concatenations into the gate.
+string state_text = switch ST
+    10 => "PENDING"
+    1 => "A SET"
+    2 => "B SET"
+    3 => "VALIDATE C"
+    4 => "ARMED"
+    5 => "IN TRADE"
+    => "IDLE"
+if barstate.islast
+    int active_liq = 0
+    int pool_n = array.size(liqUse)
+    if pool_n > 0
+        for i = 0 to pool_n - 1
+            if not array.get(liqUse, i)
+                active_liq += 1
+    string expiry_text = ST == 0 ? "-" : ST == 5 ? str.tostring(math.max(0, trade_exp - (bar_index - t_bar))) + " bars left" : str.tostring(math.max(0, setup_exp - (bar_index - st_bar))) + " bars left"
+    string trend_note = not inputs_ok ? "CHECK INPUTS" : tf_warning ? "HTF < chart: sampled" : trend_ok ? trend_mode + " OK" : trend_mode + " BLOCKED"
+    string rr_text = na(rr) ? "-" : str.tostring(rr, "#.##")
+    // Chart status line (bottom right) — counters moved here from the old 14-row table.
+    string stats_line = "SW " + str.tostring(n_swp) + " · GRAB " + str.tostring(n_grab) + " · BUY " + str.tostring(n_sig) + " · TP1 " + str.tostring(n_tp1) + " · TP2 " + str.tostring(n_tp2) + " · SL " + str.tostring(n_sl) + " · TIME " + str.tostring(n_timeout) + " · SSL " + str.tostring(active_liq)
+    string miss_line = "MISS: " + str.tostring(n_missVol) + "V " + str.tostring(n_missTrend) + "t " + str.tostring(n_missDeep) + "d " + str.tostring(n_missC) + "c " + str.tostring(n_missS) + "S " + str.tostring(n_missE) + "E " + str.tostring(n_missM) + "M " + str.tostring(n_missR) + "R"
+    if show_stats
+        table.cell(st, 0, 0, stats_line, text_color = color.white, text_size = size.tiny, bgcolor = color.new(c_bg, 10))
+        table.cell(st, 0, 1, miss_line, text_color = color.new(color.gray, 10), text_size = size.tiny, bgcolor = color.new(c_bg, 10))
+        // Step 11: strength-gate rejection counters.
+        string gate_line = "GATE: W1 " + str.tostring(n_gateW1) + " · W2 " + str.tostring(n_gateW2) + " · W3 " + str.tostring(n_gateW3)
+        table.cell(st, 0, 2, gate_line, text_color = color.new(color.gray, 10), text_size = size.tiny, bgcolor = color.new(c_bg, 10))
+    else
+        table.clear(st, 0, 0, 0, 2)
+    if show_dash
+        table.cell(d, 0, 0, "MODULE", text_color = color.white, text_size = size.small, bgcolor = c_hdr)
+        table.cell(d, 1, 0, "VALUE", text_color = color.white, text_size = size.small, bgcolor = c_hdr)
+        table.cell(d, 2, 0, "NOTE", text_color = color.white, text_size = size.small, bgcolor = c_hdr)
+        // Step 13: row 1 is Direction (the side the engine is looking for).
+        // Step 12c: column 1 shows the configured mode, column 2 the live side.
+        table.cell(d, 0, 1, "Direction", text_color = color.white, text_size = size.small)
+        table.cell(d, 1, 1, trade_dir == "Both" ? "BOTH" : (trade_dir == "Sell Only" ? "SELL ONLY" : "BUY ONLY"), text_color = trade_dir == "Both" ? c_strc : (trade_dir == "Sell Only" ? c_bear : c_bull), text_size = size.small)
+        table.cell(d, 2, 1, ST > 0 ? (tdir > 0 ? "BUY" : "SELL") + " · " + trend_note : trend_note, text_color = color.white, text_size = size.small)
+        table.cell(d, 0, 2, "State", text_color = color.white, text_size = size.small)
+        table.cell(d, 1, 2, state_text, text_color = c_swp, text_size = size.small)
+        table.cell(d, 2, 2, expiry_text, text_color = color.white, text_size = size.small)
+        table.cell(d, 0, 3, "Session", text_color = color.white, text_size = size.small)
+        table.cell(d, 1, 3, not use_ses ? "OFF" : in_session ? "IN" : "OUT", text_color = in_session ? c_bull : c_inact, text_size = size.small)
+        table.cell(d, 2, 3, ses_mode, text_color = color.white, text_size = size.small)
+        table.cell(d, 0, 4, "Entry", text_color = color.white, text_size = size.small)
+        table.cell(d, 1, 4, f_price(entry_lvl), text_color = c_strc, text_size = size.small)
+        table.cell(d, 2, 4, "R:R " + rr_text, text_color = color.white, text_size = size.small)
+        table.cell(d, 0, 5, "SL", text_color = color.white, text_size = size.small)
+        table.cell(d, 1, 5, f_price(sl), text_color = c_bear, text_size = size.small)
+        table.cell(d, 2, 5, "TP1 " + f_price(tp1), text_color = c_bull, text_size = size.small)
+        table.cell(d, 0, 6, "TP2", text_color = color.white, text_size = size.small)
+        table.cell(d, 1, 6, f_price(tp2), text_color = c_bull, text_size = size.small)
+        table.cell(d, 2, 6, "min R:R " + str.tostring(r_r_min, "#.##"), text_color = color.white, text_size = size.small)
+    else
+        table.clear(d, 0, 0, 2, 6)
+
+// N. Seven global alert conditions. Set TradingView alerts to Once Per Bar Close.
+alertcondition(sigBuy, "BUY", "Liq-ABC: BUY at {{close}}")
+alertcondition(sigArm, "Armed", "Liq-ABC: ABC valid, waiting breakout")
+alertcondition(sigSwp, "Sweep", "Liq-ABC: sweep confirmed")
+alertcondition(sigGrab, "Grab", "Liq-ABC: penetration without reclaim")
+alertcondition(sigTp1, "TP1", "Liq-ABC: TP1 (1.28) hit")
+alertcondition(sigTp2, "TP2", "Liq-ABC: TP2 (2.0) hit")
+alertcondition(sigSl, "Stop", "Liq-ABC: stop (Point C) hit")
